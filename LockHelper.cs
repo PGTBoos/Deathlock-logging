@@ -47,14 +47,14 @@ public static class LockHelper
     private sealed class HolderInfo
     {
         public int ThreadId;
-        public string Name;
-        public string ThreadName;
+        public string Name = "";
+        public string ThreadName = "";
         public long AcquiredTicks;
     }
 
     private sealed class ReferenceEqualityComparer : IEqualityComparer<object>
     {
-        public new bool Equals(object x, object y) => ReferenceEquals(x, y);
+        public new bool Equals(object? x, object? y) => ReferenceEquals(x, y);
         public int GetHashCode(object obj) => RuntimeHelpers.GetHashCode(obj);
     }
 
@@ -119,7 +119,7 @@ public static class LockHelper
 
             // Decide whether to drop a marker file. For fast, uncontended locks we skip it
             // entirely so this wrapper is safe even on hot locks taken thousands of times/sec.
-            string markerPath = null;
+            string? markerPath = null;
             bool shouldMark = waitedMs >= MarkerFileMinWaitMs || blockedBy != null;
             if (shouldMark)
             {
@@ -129,7 +129,7 @@ public static class LockHelper
             // Watchdog: if the critical section runs long, create the marker even if we
             // didn't initially. We check after MarkerFileMinHeldMs of holding.
             // Simple approach: register a Timer that fires once.
-            Timer slowHoldWatchdog = null;
+            Timer? slowHoldWatchdog = null;
             if (markerPath == null)
             {
                 slowHoldWatchdog = new Timer(_ =>
@@ -158,7 +158,7 @@ public static class LockHelper
 
                 bool interesting =
                     waitedMs >= LogIfWaitedMsAtLeast ||
-                    heldMs   >= LogIfHeldMsAtLeast   ||
+                    heldMs >= LogIfHeldMsAtLeast ||
                     blockedBy != null;
 
                 if (interesting)
@@ -181,16 +181,16 @@ public static class LockHelper
     }
 
     /// <summary>Func-returning overload, for `return myLock.WithLockDebug("Name", () => ...);`</summary>
-    public static T WithLockDebug<T>(this object obj, string name, Func<T> func)
+    public static T? WithLockDebug<T>(this object obj, string name, Func<T> func)
     {
         if (func == null) throw new ArgumentNullException(nameof(func));
-        T result = default;
+        T? result = default;
         obj.WithLockDebug(name, () => { result = func(); });
         return result;
     }
 
-    private static string TryCreateMarker(string name, int tid, string tname,
-        DateTime enterTs, long waitedMs, HolderInfo blockedBy)
+    private static string? TryCreateMarker(string name, int tid, string tname,
+        DateTime enterTs, long waitedMs, HolderInfo? blockedBy)
     {
         try
         {
