@@ -1,7 +1,8 @@
 # LockHelper
 
 A drop-in `lock` instrumentation tool for C# / .NET. Designed for one specific job:   
-**finding deadlocks and lock contention in a running application without adding a heavyweight profiler.**
+
+> **finding deadlocks and lock contention in a running application without adding a heavyweight profiler.**
 
 The trick: each currently-held lock is represented as a tiny file in a directory.  
 The file is created when the lock is acquired and deleted when it's released.  
