@@ -1,105 +1,254 @@
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading;
-using System.Threading.Tasks;
- 
+
 /// <summary>
-/// Sample: a classic A→B / B→A deadlock, instrumented with LockHelper.
+/// Drop-in lock instrumentation for hunting deadlocks and contention.
 ///
-/// Run this program. Open another terminal and run:
-///   Linux/macOS: watch -n 1 'ls -la locks-active/'
-///   Windows:     while (1) { cls; dir locks-active; sleep 1 }
+/// Replace `lock (obj) { ... }` with `obj.WithLockDebug("Name", () => { ... });`
+/// and watch the `locks-active/` directory while the app runs. Each currently-held
+/// lock appears as a file there; it disappears on release. A file that won't go
+/// away IS your deadlock — the filename tells you which thread, which lock, and when.
 ///
-/// Within a second or two of the deadlock occurring, you'll see two .lock files
-/// stuck in the directory and not going away. Their filenames tell you exactly
-/// which threads and which locks are involved. Open them — the contents show
-/// timestamps and (on the second one to deadlock) which thread blocked it.
-///
-/// To verify the no-op mode: set LockHelper.EnableLockLogging = false at the top
-/// of Main and re-run. You'll still get the deadlock (this code IS broken on
-/// purpose) but no marker files or history log — proving the wrapper is truly
-/// transparent when disabled.
+/// Set EnableLockLogging = false to make the wrapper a no-op (plain `lock` semantics).
 /// </summary>
-public class DeadlockSample
+public static class LockHelper
 {
-    private static readonly object _lockA = new object();
-    private static readonly object _lockB = new object();
- 
-    public static void Main()
+    public static bool EnableLockLogging = true;
+
+    /// <summary>Directory where one file is created per held lock. Defaults to ./locks-active</summary>
+    public static string LockDir = "locks-active";
+
+    /// <summary>Append-only log of completed lock events (only the interesting ones).</summary>
+    public static string HistoryLog = "locks-history.log";
+
+    /// <summary>Skip creating a marker file for locks acquired faster than this. Avoids disk I/O on hot, uncontended locks.</summary>
+    public static int MarkerFileMinWaitMs = 10;
+
+    /// <summary>Also create a marker file if the lock has been held longer than this, even if it was acquired quickly. Catches "fast acquire, slow critical section" cases.</summary>
+    public static int MarkerFileMinHeldMs = 100;
+
+    /// <summary>Threshold for writing a line to the history log.</summary>
+    public static int LogIfWaitedMsAtLeast = 50;
+    public static int LogIfHeldMsAtLeast = 100;
+
+    private static readonly ConcurrentDictionary<object, HolderInfo> _holders =
+        new ConcurrentDictionary<object, HolderInfo>(new ReferenceEqualityComparer());
+
+    private static readonly BlockingCollection<string> _historyQueue =
+        new BlockingCollection<string>(boundedCapacity: 100_000);
+    private static readonly Thread _historyWriter;
+
+    private sealed class HolderInfo
     {
-        // Optional: customize where files go. Defaults are fine.
-        // LockHelper.LockDir = "/tmp/my-app-locks";
-        // LockHelper.MarkerFileMinWaitMs = 50;
- 
-        Console.WriteLine("Starting deadlock demo.");
-        Console.WriteLine($"Watch the '{LockHelper.LockDir}' directory.");
-        Console.WriteLine($"History log: {LockHelper.HistoryLog}");
-        Console.WriteLine();
- 
-        // First, do some normal lock work to show the healthy case.
-        // These are fast and uncontended, so NO marker files will appear
-        // (MarkerFileMinWaitMs filter skips them) — the directory stays clean.
-        Console.WriteLine("Phase 1: normal lock activity (directory should stay empty)...");
-        for (int i = 0; i < 100; i++)
+        public int ThreadId;
+        public string Name = "";
+        public string ThreadName = "";
+        public long AcquiredTicks;
+    }
+
+    private sealed class ReferenceEqualityComparer : IEqualityComparer<object>
+    {
+        public new bool Equals(object? x, object? y) => ReferenceEquals(x, y);
+        public int GetHashCode(object obj) => RuntimeHelpers.GetHashCode(obj);
+    }
+
+    static LockHelper()
+    {
+        try
         {
-            _lockA.WithLockDebug("Counter.Increment", () =>
+            Directory.CreateDirectory(LockDir);
+            // Clean up stale marker files from a previous run (e.g. after a crash).
+            // Otherwise leftover files would look like permanent deadlocks.
+            foreach (var stale in Directory.EnumerateFiles(LockDir, "*.lock"))
             {
-                Thread.Sleep(1);
-            });
+                try { File.Delete(stale); } catch { /* best-effort */ }
+            }
         }
-        Console.WriteLine("Done. Directory should still be empty.");
-        Console.WriteLine();
- 
-        // Now demonstrate a long-held lock — this WILL show up as a marker file
-        // because the slow-hold watchdog kicks in after MarkerFileMinHeldMs.
-        Console.WriteLine("Phase 2: a slow critical section (marker file will appear briefly)...");
-        _lockA.WithLockDebug("SlowOperation", () =>
+        catch { /* if we can't create the dir, marker files are skipped silently */ }
+
+        _historyWriter = new Thread(HistoryWriterLoop)
         {
-            Thread.Sleep(500);
-        });
-        Console.WriteLine("Done. Marker file deleted on release.");
-        Console.WriteLine();
- 
-        // Now the actual deadlock.
-        Console.WriteLine("Phase 3: provoking a deadlock. Watch the directory now!");
-        Console.WriteLine("Two .lock files will appear and STAY THERE — that's the bug.");
-        Console.WriteLine("Press Ctrl+C to exit when you've seen enough.");
-        Console.WriteLine();
- 
-        var t1 = new Thread(Worker1) { Name = "Worker-AB", IsBackground = true };
-        var t2 = new Thread(Worker2) { Name = "Worker-BA", IsBackground = true };
-        t1.Start();
-        t2.Start();
- 
-        // Keep the main thread alive so the deadlock is observable.
-        // In a real app you'd hit Ctrl+C; here we just block forever.
-        Thread.Sleep(Timeout.Infinite);
+            IsBackground = true,
+            Name = "LockHelper.HistoryWriter"
+        };
+        _historyWriter.Start();
     }
- 
-    // Acquires A, then B
-    private static void Worker1()
+
+    /// <summary>Wraps `lock (obj) { action(); }` with diagnostics.</summary>
+    public static void WithLockDebug(this object obj, string name, Action action)
     {
-        _lockA.WithLockDebug("ResourceA", () =>
+        if (obj == null) throw new ArgumentNullException(nameof(obj));
+        if (action == null) throw new ArgumentNullException(nameof(action));
+        if (obj is string || obj.GetType().IsValueType)
+            throw new ArgumentException(
+                "Lock target must be a non-string reference type.", nameof(obj));
+
+        if (!EnableLockLogging)
         {
-            Thread.Sleep(100); // give Worker2 time to grab B
-            _lockB.WithLockDebug("ResourceB", () =>
+            lock (obj) { action(); }
+            return;
+        }
+
+        var tid = Thread.CurrentThread.ManagedThreadId;
+        var tname = Thread.CurrentThread.Name ?? "-";
+        var enterTs = DateTime.UtcNow;
+        var waitTimer = Stopwatch.StartNew();
+
+        // Snapshot whoever currently holds it (racy but useful for diagnosis).
+        _holders.TryGetValue(obj, out var blockedBy);
+
+        lock (obj)
+        {
+            var waitedMs = waitTimer.ElapsedMilliseconds;
+            var holdTimer = Stopwatch.StartNew();
+
+            var info = new HolderInfo
             {
-                // Never reached.
-                Console.WriteLine("Worker1 got both locks (impossible in this demo).");
-            });
-        });
+                ThreadId = tid,
+                Name = name,
+                ThreadName = tname,
+                AcquiredTicks = Stopwatch.GetTimestamp()
+            };
+            _holders[obj] = info;
+
+            // Decide whether to drop a marker file. For fast, uncontended locks we skip it
+            // entirely so this wrapper is safe even on hot locks taken thousands of times/sec.
+            string? markerPath = null;
+            bool shouldMark = waitedMs >= MarkerFileMinWaitMs || blockedBy != null;
+            if (shouldMark)
+            {
+                markerPath = TryCreateMarker(name, tid, tname, enterTs, waitedMs, blockedBy);
+            }
+
+            // Watchdog: if the critical section runs long, create the marker even if we
+            // didn't initially. We check after MarkerFileMinHeldMs of holding.
+            // Simple approach: register a Timer that fires once.
+            Timer? slowHoldWatchdog = null;
+            if (markerPath == null)
+            {
+                slowHoldWatchdog = new Timer(_ =>
+                {
+                    if (markerPath == null)
+                        markerPath = TryCreateMarker(name, tid, tname, enterTs, waitedMs, blockedBy);
+                }, null, MarkerFileMinHeldMs, Timeout.Infinite);
+            }
+
+            try
+            {
+                action();
+            }
+            finally
+            {
+                slowHoldWatchdog?.Dispose();
+                _holders.TryRemove(obj, out _);
+
+                // Delete the marker if we created one. THIS is the "remove on release".
+                if (markerPath != null)
+                {
+                    try { File.Delete(markerPath); } catch { /* ignore */ }
+                }
+
+                var heldMs = holdTimer.ElapsedMilliseconds;
+
+                bool interesting =
+                    waitedMs >= LogIfWaitedMsAtLeast ||
+                    heldMs   >= LogIfHeldMsAtLeast   ||
+                    blockedBy != null;
+
+                if (interesting)
+                {
+                    var sb = new StringBuilder(256);
+                    sb.Append(enterTs.ToString("O"))
+                      .Append(' ').Append(name)
+                      .Append(" T").Append(tid).Append('(').Append(tname).Append(')')
+                      .Append(" waited=").Append(waitedMs).Append("ms")
+                      .Append(" held=").Append(heldMs).Append("ms");
+                    if (blockedBy != null)
+                    {
+                        sb.Append(" blockedBy=T").Append(blockedBy.ThreadId)
+                          .Append('/').Append(blockedBy.Name);
+                    }
+                    _historyQueue.TryAdd(sb.ToString());
+                }
+            }
+        }
     }
- 
-    // Acquires B, then A — opposite order, classic deadlock
-    private static void Worker2()
+
+    /// <summary>Func-returning overload, for `return myLock.WithLockDebug("Name", () => ...);`</summary>
+    public static T? WithLockDebug<T>(this object obj, string name, Func<T> func)
     {
-        _lockB.WithLockDebug("ResourceB", () =>
+        if (func == null) throw new ArgumentNullException(nameof(func));
+        T? result = default;
+        obj.WithLockDebug(name, () => { result = func(); });
+        return result;
+    }
+
+    private static string? TryCreateMarker(string name, int tid, string tname,
+        DateTime enterTs, long waitedMs, HolderInfo? blockedBy)
+    {
+        try
         {
-            Thread.Sleep(100); // give Worker1 time to grab A
-            _lockA.WithLockDebug("ResourceA", () =>
+            var safeName = SanitizeForFilename(name);
+            var filename = $"{enterTs:yyyyMMddTHHmmss.fff}_T{tid:D4}_{safeName}.lock";
+            var path = Path.Combine(LockDir, filename);
+
+            var contents = new StringBuilder();
+            contents.Append("acquired=").Append(enterTs.ToString("O")).Append('\n');
+            contents.Append("thread=").Append(tid).Append(" (").Append(tname).Append(")\n");
+            contents.Append("name=").Append(name).Append('\n');
+            contents.Append("waitedMs=").Append(waitedMs).Append('\n');
+            if (blockedBy != null)
             {
-                // Never reached.
-                Console.WriteLine("Worker2 got both locks (impossible in this demo).");
-            });
-        });
+                contents.Append("blockedBy=T").Append(blockedBy.ThreadId)
+                        .Append(" holding=").Append(blockedBy.Name).Append('\n');
+            }
+
+            File.WriteAllText(path, contents.ToString());
+            return path;
+        }
+        catch
+        {
+            return null; // never let logging break the lock
+        }
+    }
+
+    private static string SanitizeForFilename(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "_";
+        var invalid = Path.GetInvalidFileNameChars();
+        var chars = s.ToCharArray();
+        for (int i = 0; i < chars.Length; i++)
+            if (Array.IndexOf(invalid, chars[i]) >= 0) chars[i] = '_';
+        return new string(chars);
+    }
+
+    private static void HistoryWriterLoop()
+    {
+        try
+        {
+            using var fs = new FileStream(HistoryLog, FileMode.Append,
+                FileAccess.Write, FileShare.Read, 4096, FileOptions.SequentialScan);
+            using var sw = new StreamWriter(fs) { AutoFlush = false };
+            foreach (var line in _historyQueue.GetConsumingEnumerable())
+            {
+                sw.WriteLine(line);
+                if (_historyQueue.Count == 0) sw.Flush();
+            }
+            sw.Flush();
+        }
+        catch { /* writer thread should never crash the app */ }
+    }
+
+    /// <summary>Call before process exit if you want guaranteed flush of the history log.</summary>
+    public static void Shutdown(TimeSpan? timeout = null)
+    {
+        _historyQueue.CompleteAdding();
+        _historyWriter.Join(timeout ?? TimeSpan.FromSeconds(2));
     }
 }
